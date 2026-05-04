@@ -18,16 +18,91 @@ Exit codes:
 """
 
 import os
+import re
 import shlex
 import signal
 import subprocess
 import sys
 import threading
+import time
 
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+
+# Strings sudo / pam_u2f write to stderr that we don't want surfaced to
+# the user — the dialog already conveys all of this visually.
+_DROP_STRINGS = [
+    b'Please touch the FIDO authenticator.\n',
+    b'Please touch the FIDO authenticator.',
+]
+_DROP_RES = [
+    re.compile(rb'\[sudo\] password for [^:]+:[ \t]*'),
+    re.compile(rb'Sorry, try again\.\n?'),
+    re.compile(rb'sudo: a password is required\n?'),
+    re.compile(rb'sudo: \d+ incorrect password attempts?\n?'),
+]
+_FILTER_TAIL = 80  # bytes withheld each pass to catch patterns split across reads
+
+
+def _scrub(data):
+    for s in _DROP_STRINGS:
+        data = data.replace(s, b'')
+    for r in _DROP_RES:
+        data = r.sub(b'', data)
+    return data
+
+
+def _pipe_filter(src, dst_fileobj):
+    """Read from a Popen pipe (src), strip known auth chatter, write the
+    rest to dst_fileobj.buffer (sys.stdout or sys.stderr).
+
+    sudo writes pam_u2f's cue to *stdout* (via SUDO_CONV_INFO_MSG) and
+    the password prompt to *stderr* — we filter both. Real command
+    output passes through; the patterns are unique enough that
+    collisions with command output are vanishingly unlikely.
+    """
+    out = dst_fileobj.buffer
+    leftover = b''
+    while True:
+        try:
+            chunk = src.read(4096)
+        except Exception:
+            break
+        if not chunk:
+            break
+        data = _scrub(leftover + chunk)
+        if len(data) > _FILTER_TAIL:
+            try:
+                out.write(data[:-_FILTER_TAIL])
+                out.flush()
+            except Exception:
+                pass
+            leftover = data[-_FILTER_TAIL:]
+        else:
+            leftover = data
+
+    leftover = _scrub(leftover)
+    if leftover:
+        try:
+            out.write(leftover)
+            out.flush()
+        except Exception:
+            pass
+
+
+def _spawn_filters(proc):
+    """Attach scrub-and-forward threads to proc's stdout and stderr."""
+    threading.Thread(
+        target=_pipe_filter, args=(proc.stdout, sys.stdout),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_pipe_filter, args=(proc.stderr, sys.stderr),
+        daemon=True,
+    ).start()
 
 APP_ID = 'org.jack.SudoTouchDialog'
 EXIT_CANCEL = 77
@@ -111,6 +186,8 @@ class SudoApp(Adw.Application):
         self.cancelled = False
         self.killed_intentionally = False
         self.state = None
+        self._held = False  # whether we've called self.hold() to keep app alive past window close
+        self.win = None
 
     def do_activate(self):
         if is_cached():
@@ -282,12 +359,45 @@ class SudoApp(Adw.Application):
     def _switch_to_password(self):
         self.password_mode = True
         self.killed_intentionally = True
-        # Flip UI immediately; kill the in-flight sudo -A in the background
-        # so the user sees the password entry without waiting for sudo to
-        # actually die (pam_u2f's HID wait can take a moment to unblock).
+        # Flip UI immediately; SIGKILL is just a syscall (fast).
         self.state_label.set_label('Enter your password:')
         self._apply_state()
-        threading.Thread(target=self._kill_sudo, daemon=True).start()
+        self._kill_sudo()
+
+    def _watch_cmd_start(self, proc):
+        """Detect when sudo hands off to the wrapped command, then hide
+        the dialog so the user's desktop isn't dim_around'ed for the
+        duration of long-running commands. The app is held alive so
+        _wait_sudo can still report the final exit code."""
+        while not self.cancelled and proc.poll() is None:
+            try:
+                # pgrep -P returns sudo's children. Once sudo has spawned
+                # the actual command, auth is done.
+                out = subprocess.check_output(
+                    ['pgrep', '-P', str(proc.pid)],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                if out:
+                    GLib.idle_add(self._on_cmd_started)
+                    return
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+            time.sleep(0.15)
+
+    def _on_cmd_started(self):
+        if self.cancelled or not self.win:
+            return False
+        # Auth done; sudo is now running the wrapped command.
+        # hold() keeps the GApplication alive once the window closes so
+        # _wait_sudo can still propagate the final exit code.
+        self.hold()
+        self._held = True
+        try:
+            self.win.close()
+        except Exception:
+            pass
+        self.win = None
+        return False
 
     def _spawn_sudo_a(self):
         # Set up FIFO for the password bridge (only consumed if pam_u2f
@@ -311,12 +421,18 @@ class SudoApp(Adw.Application):
             self.sudo_proc = subprocess.Popen(
                 ['sudo', '-A', '--'] + self.command,
                 env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
         except FileNotFoundError:
             self.state_label.set_label('sudo not found.')
             return False
 
+        _spawn_filters(self.sudo_proc)
         threading.Thread(target=self._wait_sudo, daemon=True).start()
+        threading.Thread(
+            target=self._watch_cmd_start, args=(self.sudo_proc,), daemon=True,
+        ).start()
         return False
 
     def _wait_sudo(self):
@@ -345,17 +461,14 @@ class SudoApp(Adw.Application):
         # SIGKILL directly; SIGTERM would queue behind pam_u2f's blocking
         # libfido2 call (which has no async cancel) and effectively wait
         # for the device timeout. SIGKILL bypasses that — kernel tears
-        # down the process and closes /dev/hidraw immediately.
+        # down the process and closes /dev/hidraw immediately. Just the
+        # syscall, no wait — zombies will be reaped on process exit.
         proc = self.sudo_proc
         self.sudo_proc = None
         if proc is None or proc.poll() is not None:
             return
         try:
             proc.kill()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -378,8 +491,14 @@ class SudoApp(Adw.Application):
             p = subprocess.Popen(
                 ['sudo', '-S', '--'] + self.command,
                 stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
             self.sudo_proc = p
+            _spawn_filters(p)
+            threading.Thread(
+                target=self._watch_cmd_start, args=(p,), daemon=True,
+            ).start()
             # Send pw via stdin, then close it so the command can read its
             # own stdin (if any) from the inherited descriptor.
             try:
@@ -394,7 +513,17 @@ class SudoApp(Adw.Application):
 
     def _run_cached(self):
         try:
-            rc = subprocess.call(['sudo', '-n', '--'] + self.command)
+            p = subprocess.Popen(
+                ['sudo', '-n', '--'] + self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.sudo_proc = p
+            _spawn_filters(p)
+            threading.Thread(
+                target=self._watch_cmd_start, args=(p,), daemon=True,
+            ).start()
+            rc = p.wait()
         except Exception:
             rc = 1
         GLib.idle_add(self._on_sudo_done_pw, rc)
@@ -415,24 +544,23 @@ class SudoApp(Adw.Application):
             return
         self.cancelled = True
         self.exit_code = EXIT_CANCEL
-        # Close UI immediately. Kill sudo in the background — pam_u2f's
-        # blocking HID wait means sudo can't actually exit until the
-        # kernel tears it down via SIGKILL, which we don't want to wait
-        # for synchronously.
-        self._cleanup_fifo()
-        try:
-            self.win.close()
-        except Exception:
-            pass
-        threading.Thread(target=self._kill_sudo, daemon=True).start()
-        self.quit()
+        self._kill_sudo()
+        self._finish()
 
     def _finish(self):
         self._cleanup_fifo()
-        try:
-            self.win.close()
-        except Exception:
-            pass
+        if self.win is not None:
+            try:
+                self.win.close()
+            except Exception:
+                pass
+            self.win = None
+        if self._held:
+            try:
+                self.release()
+            except Exception:
+                pass
+            self._held = False
         self.quit()
 
     def _cleanup_fifo(self):
