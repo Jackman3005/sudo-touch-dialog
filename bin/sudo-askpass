@@ -1,0 +1,43 @@
+#!/bin/bash
+# Wrapper that gates sudo behind a confirmation/auth dialog.
+#
+# The dialog (sudo-touch-dialog) runs the actual sudo command itself —
+# we don't do `sudo -v` then `sudo -n cmd`, because without a controlling
+# tty the timestamp doesn't carry across parent processes.
+#
+# Flow:
+#   1. Acquire a per-user lock so concurrent invocations queue up.
+#   2. Run sudo-touch-dialog, which presents the confirm/touch/password
+#      UI and runs sudo internally with the real command.
+#   3. Forward the dialog's exit code (= sudo's exit code, or 77 if
+#      the user explicitly cancelled).
+#   4. Log APPROVED / REJECTED / FAILED.
+
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/sudo-askpass/asksudo.log"
+mkdir -p "$(dirname "$LOG")"
+
+LOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+LOCK="$LOCK_DIR/sudo-askpass.lock"
+
+cmd="$*"
+ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+(
+    flock 9
+
+    /usr/bin/python "$HOME/.local/bin/sudo-touch-dialog" -- "$@"
+    rc=$?
+
+    if [ $rc -eq 77 ]; then
+        echo "$ts REJECTED $cmd" >> "$LOG"
+        echo "sudo: command rejected by user" >&2
+        exit 77
+    fi
+
+    if [ $rc -eq 0 ]; then
+        echo "$ts APPROVED $cmd" >> "$LOG"
+    else
+        echo "$ts FAILED   $cmd (rc=$rc)" >> "$LOG"
+    fi
+    exit $rc
+) 9>"$LOCK"

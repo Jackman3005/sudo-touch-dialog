@@ -1,0 +1,6 @@
+#!/bin/bash
+# Bridge: invoked by sudo as SUDO_ASKPASS, reads password from a FIFO
+# written by sudo-touch-dialog. The dialog only writes when the user
+# explicitly chooses the password fallback; otherwise this blocks until
+# the dialog is closed (which kills sudo via the process group).
+exec cat "${SUDO_ASKPASS_FIFO:?SUDO_ASKPASS_FIFO not set}"

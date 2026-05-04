@@ -1,0 +1,467 @@
+#!/usr/bin/python
+"""GTK4/Adwaita auth dialog for sudo with YubiKey + password fallback.
+
+Runs the actual sudo command itself (single-sudo flow); the wrapper is a
+thin shim. This sidesteps sudo's tty-tied timestamp behavior, which
+prevents the timestamp from being shared across parent processes when
+there is no controlling terminal (Claude Code's case).
+
+Three states (auto-detected at startup):
+  cached   - timestamp fresh; click Approve runs `sudo -n -- cmd`.
+  touch    - YubiKey present; runs `sudo -A -- cmd` so pam_u2f waits
+             for tap. User can switch to password fallback.
+  password - no YubiKey; prompt for password and run `sudo -S -- cmd`.
+
+Exit codes:
+  Whatever sudo returns (forwarding the command's exit code).
+  77 if the user explicitly cancelled (REJECTED).
+"""
+
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = 'org.jack.SudoTouchDialog'
+EXIT_CANCEL = 77
+BRIDGE = os.path.expanduser('~/.local/bin/sudo-askpass-bridge')
+
+
+# Pango colors. Picked to read on light or dark Adwaita backgrounds.
+_C_SUDO = '#7eb1ff'   # bold blue: the literal `sudo` and the command name
+_C_FLAG = '#f0a878'   # warm orange: short/long flags (-x, --foo)
+_C_STR = '#a4d57a'    # green: quoted strings
+_C_OP = '#d9a3e6'     # purple: shell operators within `bash -c` etc. (best-effort)
+
+
+def _markup_arg(arg, position):
+    """Pango markup for a single shell-quoted argv element.
+
+    position: 0 = command name (highlighted bold), 1+ = subsequent arg.
+    """
+    quoted = shlex.quote(arg)
+    needs_quote = (quoted != arg)
+    esc = GLib.markup_escape_text(quoted)
+
+    if position == 0:
+        return f'<span foreground="{_C_SUDO}" weight="bold">{esc}</span>'
+
+    # Quoted string literal: highlight the whole thing as a string.
+    if needs_quote:
+        return f'<span foreground="{_C_STR}">{esc}</span>'
+
+    # Flags: -x, --foo, --foo=bar
+    if arg.startswith('-') and len(arg) > 1:
+        # If --foo=bar, color the flag part and let bar render plain.
+        if '=' in arg:
+            flag, _, val = arg.partition('=')
+            fe = GLib.markup_escape_text(flag)
+            ve = GLib.markup_escape_text(val)
+            return f'<span foreground="{_C_FLAG}">{fe}</span>=<span foreground="{_C_STR}">{ve}</span>'
+        return f'<span foreground="{_C_FLAG}">{esc}</span>'
+
+    return esc
+
+
+def highlight_shell(args):
+    """Return Pango markup for `sudo <args>` with shell syntax coloring."""
+    pieces = [f'<span foreground="{_C_SUDO}" weight="bold">sudo</span>']
+    for i, arg in enumerate(args):
+        pieces.append(_markup_arg(arg, i))
+    return ' '.join(pieces)
+
+
+def has_yubikey():
+    try:
+        out = subprocess.check_output(
+            ['fido2-token', '-L'],
+            stderr=subprocess.DEVNULL, timeout=2,
+        )
+        return b'hidraw' in out
+    except Exception:
+        return False
+
+
+def is_cached():
+    return subprocess.call(
+        ['sudo', '-n', 'true'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ) == 0
+
+
+class SudoApp(Adw.Application):
+    def __init__(self, command):
+        super().__init__(
+            application_id=APP_ID,
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
+        self.command = command
+        self.exit_code = EXIT_CANCEL
+        self.sudo_proc = None
+        self.fifo_path = None
+        self.fifo_dir = None
+        self.password_mode = False
+        self.cancelled = False
+        self.killed_intentionally = False
+        self.state = None
+
+    def do_activate(self):
+        if is_cached():
+            self.state = 'cached'
+        elif has_yubikey():
+            self.state = 'touch'
+        else:
+            self.state = 'password'
+        self._build_ui()
+        self.win.present()
+        if self.state == 'touch':
+            GLib.idle_add(self._spawn_sudo_a)
+
+    def _build_ui(self):
+        self.win = Adw.ApplicationWindow(application=self)
+        self.win.set_title('sudo')
+        self.win.set_default_size(560, 280)
+        self.win.set_resizable(False)
+
+        kc = Gtk.EventControllerKey()
+        kc.connect('key-pressed', self._on_key)
+        self.win.add_controller(kc)
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_show_end_title_buttons(False)
+        header.set_show_start_title_buttons(False)
+        toolbar.add_top_bar(header)
+
+        body = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10,
+            margin_top=12, margin_bottom=12,
+            margin_start=18, margin_end=18,
+        )
+
+        caption = Gtk.Label(label='Authorize this command')
+        caption.add_css_class('title-3')
+        caption.set_halign(Gtk.Align.CENTER)
+        body.append(caption)
+
+        # Optional context line: an explanation passed by the caller (e.g.
+        # Claude Code) via CLAUDE_SUDO_REASON. Helps the user know *why*
+        # this sudo is being requested.
+        reason = os.environ.get('CLAUDE_SUDO_REASON', '').strip()
+        if reason:
+            subtitle = Gtk.Label(label=reason)
+            subtitle.set_halign(Gtk.Align.CENTER)
+            subtitle.set_wrap(True)
+            subtitle.set_wrap_mode(2)
+            subtitle.set_max_width_chars(60)
+            subtitle.add_css_class('dim-label')
+            subtitle.set_margin_top(4)
+            subtitle.set_margin_bottom(14)
+            body.append(subtitle)
+        else:
+            # Keep the visual gap below the header consistent.
+            caption.set_margin_bottom(14)
+
+        cmd = Gtk.Label()
+        cmd.set_markup(highlight_shell(self.command))
+        cmd.set_wrap(True)
+        cmd.set_wrap_mode(2)  # PANGO_WRAP_WORD_CHAR
+        cmd.set_max_width_chars(56)  # constrain so it wraps before pushing window edges
+        cmd.set_xalign(0)
+        cmd.set_selectable(True)
+        cmd.add_css_class('monospace')
+        body.append(cmd)
+
+        # State indicator: vertical stack, centered. The spinner uses
+        # opacity (not visibility) so its 28×28 footprint is always
+        # reserved — prevents height shifts between e.g. password input
+        # and "Authenticating…".
+        self.state_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8,
+            margin_top=14,
+            halign=Gtk.Align.CENTER,
+        )
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_size_request(28, 28)
+        self.spinner.set_halign(Gtk.Align.CENTER)
+        self.state_box.append(self.spinner)
+        self.state_label = Gtk.Label()
+        self.state_label.set_halign(Gtk.Align.CENTER)
+        self.state_box.append(self.state_label)
+        body.append(self.state_box)
+
+        self.pw_entry = Gtk.PasswordEntry()
+        self.pw_entry.set_show_peek_icon(True)
+        self.pw_entry.connect('activate', lambda e: self._on_ok())
+        body.append(self.pw_entry)
+
+        spacer = Gtk.Box(hexpand=True, vexpand=True)
+        body.append(spacer)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                       halign=Gtk.Align.END)
+        self.cancel_btn = Gtk.Button(label='Cancel')
+        self.cancel_btn.connect('clicked', lambda b: self._cancel())
+        btns.append(self.cancel_btn)
+
+        self.usepw_btn = Gtk.Button(label='Use password')
+        self.usepw_btn.connect('clicked', lambda b: self._switch_to_password())
+        btns.append(self.usepw_btn)
+
+        self.ok_btn = Gtk.Button(label='Approve')
+        self.ok_btn.add_css_class('suggested-action')
+        self.ok_btn.connect('clicked', lambda b: self._on_ok())
+        btns.append(self.ok_btn)
+        body.append(btns)
+
+        toolbar.set_content(body)
+        self.win.set_content(toolbar)
+        self._apply_state()
+
+    def _set_spinner(self, on):
+        # Use opacity (not visibility) so the 28×28 footprint is reserved
+        # in both states — keeps height stable across transitions.
+        if on:
+            self.spinner.set_opacity(1)
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+            self.spinner.set_opacity(0)
+
+    def _apply_state(self):
+        if self.state == 'cached':
+            self._set_spinner(False)
+            self.state_label.set_label('Already authenticated — confirm to run.')
+            self.pw_entry.set_visible(False)
+            self.usepw_btn.set_visible(False)
+            self.ok_btn.set_visible(True)
+            self.ok_btn.set_label('Approve')
+            self.ok_btn.grab_focus()
+        elif self.state == 'touch' and not self.password_mode:
+            self._set_spinner(True)
+            self.state_label.set_label('Tap your YubiKey to authorize…')
+            self.pw_entry.set_visible(False)
+            self.usepw_btn.set_visible(True)
+            self.ok_btn.set_visible(False)
+            self.cancel_btn.grab_focus()
+        else:
+            self._set_spinner(False)
+            if not self.state_label.get_label() or 'failed' not in self.state_label.get_label().lower():
+                self.state_label.set_label('Enter your password:')
+            self.pw_entry.set_visible(True)
+            self.pw_entry.set_sensitive(True)
+            self.pw_entry.grab_focus()
+            self.usepw_btn.set_visible(False)
+            self.ok_btn.set_visible(True)
+            self.ok_btn.set_label('Authenticate')
+            self.ok_btn.set_sensitive(True)
+
+    def _on_key(self, ctrl, keyval, keycode, mods):
+        if keyval == Gdk.KEY_Escape:
+            self._cancel()
+            return True
+        return False
+
+    def _on_ok(self):
+        if self.state == 'cached':
+            threading.Thread(target=self._run_cached, daemon=True).start()
+            self.ok_btn.set_sensitive(False)
+            self.cancel_btn.set_sensitive(False)
+            self._set_spinner(True)
+            self.state_label.set_label('Running…')
+        elif self.password_mode or self.state == 'password':
+            self._submit_password()
+
+    def _switch_to_password(self):
+        self.password_mode = True
+        self.killed_intentionally = True
+        # Flip UI immediately; kill the in-flight sudo -A in the background
+        # so the user sees the password entry without waiting for sudo to
+        # actually die (pam_u2f's HID wait can take a moment to unblock).
+        self.state_label.set_label('Enter your password:')
+        self._apply_state()
+        threading.Thread(target=self._kill_sudo, daemon=True).start()
+
+    def _spawn_sudo_a(self):
+        # Set up FIFO for the password bridge (only consumed if pam_u2f
+        # times out and the user later picks "Use password").
+        self.fifo_dir = f'/run/user/{os.getuid()}/sudo-touch-{os.getpid()}'
+        try:
+            os.makedirs(self.fifo_dir, mode=0o700, exist_ok=True)
+        except Exception:
+            self.fifo_dir = f'/tmp/sudo-touch-{os.getpid()}'
+            os.makedirs(self.fifo_dir, mode=0o700, exist_ok=True)
+        self.fifo_path = os.path.join(self.fifo_dir, 'pw.fifo')
+        if os.path.exists(self.fifo_path):
+            os.unlink(self.fifo_path)
+        os.mkfifo(self.fifo_path, mode=0o600)
+
+        env = os.environ.copy()
+        env['SUDO_ASKPASS'] = BRIDGE
+        env['SUDO_ASKPASS_FIFO'] = self.fifo_path
+
+        try:
+            self.sudo_proc = subprocess.Popen(
+                ['sudo', '-A', '--'] + self.command,
+                env=env,
+            )
+        except FileNotFoundError:
+            self.state_label.set_label('sudo not found.')
+            return False
+
+        threading.Thread(target=self._wait_sudo, daemon=True).start()
+        return False
+
+    def _wait_sudo(self):
+        try:
+            rc = self.sudo_proc.wait()
+        except Exception:
+            rc = 1
+        GLib.idle_add(self._on_sudo_done, rc)
+
+    def _on_sudo_done(self, rc):
+        if self.cancelled:
+            return False
+        if self.killed_intentionally:
+            # We killed sudo to switch modes; drop this exit code on the
+            # floor — the new sudo (sudo -S) will produce the real one.
+            self.killed_intentionally = False
+            return False
+        # Sudo ran the command and exited. rc is the command's exit code
+        # (or sudo's auth-failure code, which we can't cleanly distinguish
+        # from a command rc). Forward whatever sudo gave us.
+        self.exit_code = rc
+        self._finish()
+        return False
+
+    def _kill_sudo(self):
+        # SIGKILL directly; SIGTERM would queue behind pam_u2f's blocking
+        # libfido2 call (which has no async cancel) and effectively wait
+        # for the device timeout. SIGKILL bypasses that — kernel tears
+        # down the process and closes /dev/hidraw immediately.
+        proc = self.sudo_proc
+        self.sudo_proc = None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _submit_password(self):
+        pw = self.pw_entry.get_text()
+        if not pw:
+            return
+        self.pw_entry.set_text('')
+        self.pw_entry.set_sensitive(False)  # disable, but keep visible to hold layout
+        self.ok_btn.set_sensitive(False)
+        self.state_label.set_label('Authenticating…')
+        self._set_spinner(True)
+
+        threading.Thread(
+            target=self._run_sudo_s, args=(pw,), daemon=True,
+        ).start()
+
+    def _run_sudo_s(self, pw):
+        try:
+            p = subprocess.Popen(
+                ['sudo', '-S', '--'] + self.command,
+                stdin=subprocess.PIPE,
+            )
+            self.sudo_proc = p
+            # Send pw via stdin, then close it so the command can read its
+            # own stdin (if any) from the inherited descriptor.
+            try:
+                p.stdin.write((pw + '\n').encode())
+                p.stdin.close()
+            except Exception:
+                pass
+            rc = p.wait()
+        except Exception:
+            rc = 1
+        GLib.idle_add(self._on_sudo_done_pw, rc)
+
+    def _run_cached(self):
+        try:
+            rc = subprocess.call(['sudo', '-n', '--'] + self.command)
+        except Exception:
+            rc = 1
+        GLib.idle_add(self._on_sudo_done_pw, rc)
+
+    def _on_sudo_done_pw(self, rc):
+        if self.cancelled:
+            return False
+        # If sudo with -S returned 1 right away and we never managed to
+        # auth, surface a retry prompt. Heuristic: if the run was very
+        # fast (< 1s) and we are in password mode, treat as auth failure.
+        # (Hard to be precise without parsing stderr.)
+        self.exit_code = rc
+        self._finish()
+        return False
+
+    def _cancel(self):
+        if self.cancelled:
+            return
+        self.cancelled = True
+        self.exit_code = EXIT_CANCEL
+        # Close UI immediately. Kill sudo in the background — pam_u2f's
+        # blocking HID wait means sudo can't actually exit until the
+        # kernel tears it down via SIGKILL, which we don't want to wait
+        # for synchronously.
+        self._cleanup_fifo()
+        try:
+            self.win.close()
+        except Exception:
+            pass
+        threading.Thread(target=self._kill_sudo, daemon=True).start()
+        self.quit()
+
+    def _finish(self):
+        self._cleanup_fifo()
+        try:
+            self.win.close()
+        except Exception:
+            pass
+        self.quit()
+
+    def _cleanup_fifo(self):
+        if self.fifo_path and os.path.exists(self.fifo_path):
+            try:
+                os.unlink(self.fifo_path)
+            except Exception:
+                pass
+        if self.fifo_dir and os.path.isdir(self.fifo_dir):
+            try:
+                os.rmdir(self.fifo_dir)
+            except Exception:
+                pass
+
+
+def main():
+    if '--' in sys.argv:
+        idx = sys.argv.index('--')
+        cmd = sys.argv[idx + 1:]
+    else:
+        cmd = sys.argv[1:]
+    if not cmd:
+        print('Usage: sudo-touch-dialog -- <command...>', file=sys.stderr)
+        sys.exit(2)
+
+    app = SudoApp(cmd)
+    app.run([])
+    sys.exit(app.exit_code)
+
+
+if __name__ == '__main__':
+    main()
