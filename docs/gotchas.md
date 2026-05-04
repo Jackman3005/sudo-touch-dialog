@@ -17,9 +17,13 @@ invocations.
 **Fix if you want it**: `Defaults:<user> timestamp_type=global` in
 `/etc/sudoers.d/<user>-timestamp` gives you a single user-wide ticket.
 Tradeoff: any concurrent sudo from another session also benefits from
-that ticket.
+that ticket — slightly weaker isolation than per-tty/ppid.
 
-We didn't apply the fix — the user prefers tapping each time.
+The default in this repo is *not* to set this — tapping per command is
+fast with a YubiKey and the per-command authorization is the whole
+point of the dialog. If you find yourself authorizing many sudos in
+quick succession from agents, the global setting is the right escape
+hatch.
 
 ## 2. pam_u2f's "cue" goes to stderr, not askpass
 

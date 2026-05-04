@@ -36,12 +36,16 @@ auth was invisible to it.
 ### `bin/sudo-askpass` (bash wrapper)
 
 - Holds `/run/user/$UID/sudo-askpass.lock` while running so concurrent
-  invocations queue. Each acquires the lock in turn; later ones see
-  the timestamp from the earlier one and drop into the cached state.
+  invocations queue and the user only ever sees one dialog at a time
+  (so each tap is unambiguous about which command it authorizes).
 - Invokes the dialog with the command as positional args after `--`.
 - Logs APPROVED / REJECTED / FAILED to
   `~/.local/state/sudo-askpass/asksudo.log` based on the dialog's exit
   code.
+
+> **Note**: the lock serializes the *dialogs*, not the timestamp
+> caching. Whether queued invocations land in `cached` state depends
+> on sudo's `timestamp_type` — see `gotchas.md` §1.
 
 ### `bin/sudo-touch-dialog` (Python+GTK4)
 

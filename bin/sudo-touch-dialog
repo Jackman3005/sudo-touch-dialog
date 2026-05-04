@@ -47,6 +47,16 @@ _DROP_RES = [
 ]
 _FILTER_TAIL = 80  # bytes withheld each pass to catch patterns split across reads
 
+# Markers sudo / pam writes when authentication has failed. Used to
+# distinguish auth failure from a successfully-authed command that
+# happens to exit non-zero (e.g. `sudo false`, `sudo cat /missing`).
+_AUTH_FAIL_PATTERNS = [
+    re.compile(rb'Sorry, try again'),
+    re.compile(rb'sudo: \d+ incorrect password attempt'),
+    re.compile(rb'sudo: no password was provided'),
+    re.compile(rb'sudo: a password is required'),
+]
+
 
 def _scrub(data):
     for s in _DROP_STRINGS:
@@ -56,7 +66,7 @@ def _scrub(data):
     return data
 
 
-def _pipe_filter(src, dst_fileobj):
+def _pipe_filter(src, dst_fileobj, app=None):
     """Read from a Popen pipe (src), strip known auth chatter, write the
     rest to dst_fileobj.buffer (sys.stdout or sys.stderr).
 
@@ -64,6 +74,12 @@ def _pipe_filter(src, dst_fileobj):
     the password prompt to *stderr* — we filter both. Real command
     output passes through; the patterns are unique enough that
     collisions with command output are vanishingly unlikely.
+
+    If `app` is provided and the wrapped command has *not* started yet,
+    we additionally watch for auth-failure markers and set
+    app.auth_failed when one is seen. Restricting detection to the
+    pre-cmd window prevents false positives from command output that
+    happens to contain similar phrases.
     """
     out = dst_fileobj.buffer
     leftover = b''
@@ -74,16 +90,22 @@ def _pipe_filter(src, dst_fileobj):
             break
         if not chunk:
             break
-        data = _scrub(leftover + chunk)
-        if len(data) > _FILTER_TAIL:
+        data = leftover + chunk
+        if app is not None and not app.cmd_started and not app.auth_failed:
+            for pat in _AUTH_FAIL_PATTERNS:
+                if pat.search(data):
+                    app.auth_failed = True
+                    break
+        scrubbed = _scrub(data)
+        if len(scrubbed) > _FILTER_TAIL:
             try:
-                out.write(data[:-_FILTER_TAIL])
+                out.write(scrubbed[:-_FILTER_TAIL])
                 out.flush()
             except Exception:
                 pass
-            leftover = data[-_FILTER_TAIL:]
+            leftover = scrubbed[-_FILTER_TAIL:]
         else:
-            leftover = data
+            leftover = scrubbed
 
     leftover = _scrub(leftover)
     if leftover:
@@ -94,14 +116,14 @@ def _pipe_filter(src, dst_fileobj):
             pass
 
 
-def _spawn_filters(proc):
+def _spawn_filters(proc, app=None):
     """Attach scrub-and-forward threads to proc's stdout and stderr."""
     threading.Thread(
-        target=_pipe_filter, args=(proc.stdout, sys.stdout),
+        target=_pipe_filter, args=(proc.stdout, sys.stdout, app),
         daemon=True,
     ).start()
     threading.Thread(
-        target=_pipe_filter, args=(proc.stderr, sys.stderr),
+        target=_pipe_filter, args=(proc.stderr, sys.stderr, app),
         daemon=True,
     ).start()
 
@@ -193,6 +215,11 @@ class SudoApp(Adw.Application):
         # Reset before each new sudo invocation so retries (after a wrong
         # password) can detect their own auth outcome independently.
         self.cmd_started = False
+        # Set to True by the pipe filter when it sees an auth-failure
+        # marker in sudo's output. Used (instead of cmd_started) to
+        # decide between retry-prompt and exit-with-rc when sudo exits
+        # non-zero.
+        self.auth_failed = False
 
     def do_activate(self):
         if is_cached():
@@ -426,6 +453,7 @@ class SudoApp(Adw.Application):
         env['SUDO_ASKPASS_FIFO'] = self.fifo_path
 
         self.cmd_started = False
+        self.auth_failed = False
         try:
             self.sudo_proc = subprocess.Popen(
                 ['sudo', '-A', '--'] + self.command,
@@ -437,7 +465,7 @@ class SudoApp(Adw.Application):
             self.state_label.set_label('sudo not found.')
             return False
 
-        _spawn_filters(self.sudo_proc)
+        _spawn_filters(self.sudo_proc, app=self)
         threading.Thread(target=self._wait_sudo, daemon=True).start()
         threading.Thread(
             target=self._watch_cmd_start, args=(self.sudo_proc,), daemon=True,
@@ -459,15 +487,13 @@ class SudoApp(Adw.Application):
             # new sudo (sudo -S) will produce the real one.
             self.killed_intentionally = False
             return False
-        if rc == 0 or self.cmd_started:
-            # rc==0 always means success. cmd_started is the secondary
-            # signal for non-zero exits — if sudo handed off to the cmd
-            # at any point, this rc is the cmd's, not auth failure.
-            self.exit_code = rc
-            self._finish()
+        if rc != 0 and self.auth_failed:
+            # Saw an auth-failure marker before any cmd output → retry.
+            self._show_auth_retry()
             return False
-        # Sudo exited non-zero before launching the cmd → auth failed.
-        self._show_auth_retry()
+        # rc == 0, or cmd ran and exited non-zero. Forward the code.
+        self.exit_code = rc
+        self._finish()
         return False
 
     _ERROR_MARKUP = (
@@ -520,6 +546,7 @@ class SudoApp(Adw.Application):
     def _run_sudo_s(self, pw):
         try:
             self.cmd_started = False
+            self.auth_failed = False
             p = subprocess.Popen(
                 ['sudo', '-S', '--'] + self.command,
                 stdin=subprocess.PIPE,
@@ -527,7 +554,7 @@ class SudoApp(Adw.Application):
                 stderr=subprocess.PIPE,
             )
             self.sudo_proc = p
-            _spawn_filters(p)
+            _spawn_filters(p, app=self)
             threading.Thread(
                 target=self._watch_cmd_start, args=(p,), daemon=True,
             ).start()
@@ -546,13 +573,14 @@ class SudoApp(Adw.Application):
     def _run_cached(self):
         try:
             self.cmd_started = False
+            self.auth_failed = False
             p = subprocess.Popen(
                 ['sudo', '-n', '--'] + self.command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
             self.sudo_proc = p
-            _spawn_filters(p)
+            _spawn_filters(p, app=self)
             threading.Thread(
                 target=self._watch_cmd_start, args=(p,), daemon=True,
             ).start()
@@ -564,15 +592,11 @@ class SudoApp(Adw.Application):
     def _on_sudo_done_pw(self, rc):
         if self.cancelled:
             return False
-        if rc == 0 or self.cmd_started:
-            # rc==0 means sudo succeeded (auth + cmd both fine). For very
-            # fast commands cmd_started may not have been observed by the
-            # poller before sudo exited, so don't gate on it for rc==0.
-            self.exit_code = rc
-            self._finish()
+        if rc != 0 and self.auth_failed:
+            self._show_auth_retry()
             return False
-        # Sudo exited non-zero before launching the cmd → auth failed.
-        self._show_auth_retry()
+        self.exit_code = rc
+        self._finish()
         return False
 
     def _cancel(self):
