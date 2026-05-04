@@ -104,7 +104,7 @@ def _spawn_filters(proc):
         daemon=True,
     ).start()
 
-APP_ID = 'org.jack.SudoTouchDialog'
+APP_ID = 'io.github.Jackman3005.SudoTouchDialog'
 EXIT_CANCEL = 77
 BRIDGE = os.path.expanduser('~/.local/bin/sudo-askpass-bridge')
 

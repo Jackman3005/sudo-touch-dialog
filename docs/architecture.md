@@ -45,7 +45,7 @@ auth was invisible to it.
 
 ### `bin/sudo-touch-dialog` (Python+GTK4)
 
-- Adwaita window, app_id `org.jack.SudoTouchDialog` (matched by
+- Adwaita window, app_id `io.github.Jackman3005.SudoTouchDialog` (matched by
   Hyprland rules).
 - Three states determined at startup:
   - `cached` if `sudo -n true` succeeds.
