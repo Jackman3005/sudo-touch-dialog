@@ -24,7 +24,7 @@ captured at session start (see `gotchas.md` §5).
 
 ## The reason env var
 
-The dialog reads `CLAUDE_SUDO_REASON` and renders it as a one-line
+The dialog reads `AGENT_SUDO_REASON` and renders it as a one-line
 subtitle below the "Authorize this command" header. Keeps you informed
 about *why* the agent is asking for sudo.
 
@@ -32,13 +32,13 @@ The agent should set this just-in-time per command, not export it
 session-wide:
 
 ```bash
-CLAUDE_SUDO_REASON="installing the zig toolchain" sudo pacman -S zig
+AGENT_SUDO_REASON="installing the zig toolchain" sudo pacman -S zig
 ```
 
 Or for multiple:
 
 ```bash
-CLAUDE_SUDO_REASON="kernel rebuild for the GPIO fix" sudo limine-mkinitcpio
+AGENT_SUDO_REASON="kernel rebuild for the GPIO fix" sudo limine-mkinitcpio
 ```
 
 If the var is unset or empty, no subtitle is rendered and the layout
@@ -52,13 +52,13 @@ remembers:
 ```markdown
 ## When running sudo
 
-Always set `CLAUDE_SUDO_REASON="<short why>"` inline before any sudo
+Always set `AGENT_SUDO_REASON="<short why>"` inline before any sudo
 invocation. The value renders as a subtitle in Jack's confirmation
 dialog so he knows *why* the elevation is needed.
 
 Examples:
-- `CLAUDE_SUDO_REASON="installing zig toolchain" sudo pacman -S zig`
-- `CLAUDE_SUDO_REASON="cleaning stale orphan from the last test" sudo kill 99679`
+- `AGENT_SUDO_REASON="installing zig toolchain" sudo pacman -S zig`
+- `AGENT_SUDO_REASON="cleaning stale orphan from the last test" sudo kill 99679`
 
 Keep it short — one phrase, lowercase, no trailing period. Don't quote
 the command itself; just describe the intent.

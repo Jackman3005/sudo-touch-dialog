@@ -29,7 +29,7 @@ A small floating window appears whenever something tries to `sudo`. It:
   Pango markup (`sudo` and the command name in blue, flags in orange,
   quoted strings in green). Long commands wrap at word boundaries.
 - Optionally shows a one-line **reason** — set
-  `CLAUDE_SUDO_REASON="why this is happening"` in the env and it
+  `AGENT_SUDO_REASON="why this is happening"` in the env and it
   appears as a subtitle. (Designed for LLM-driven shells; any caller
   can use the var.)
 - Adapts to three states automatically:
@@ -135,7 +135,7 @@ single coordinated UI.
 - [`docs/gotchas.md`](docs/gotchas.md) — non-obvious things (no-tty
   timestamp, SIGTERM-vs-SIGKILL, snapshot-cached bash function, …)
 - [`docs/claude-integration.md`](docs/claude-integration.md) — bashrc
-  shim, `CLAUDE_SUDO_REASON`, suggested CLAUDE.md rule
+  shim, `AGENT_SUDO_REASON`, suggested CLAUDE.md rule
 
 ## License
 

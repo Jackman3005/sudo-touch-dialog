@@ -12,7 +12,7 @@ sudo() shim in ~/.bashrc      ── only for non-interactive shells
 ~/.local/bin/sudo-askpass     ── flock /run/user/$UID/sudo-askpass.lock
    │                             logs to ~/.local/state/sudo-askpass/asksudo.log
    ▼
-sudo-touch-dialog (GTK4)      ── reads CLAUDE_SUDO_REASON, fido2-token -L,
+sudo-touch-dialog (GTK4)      ── reads AGENT_SUDO_REASON, fido2-token -L,
    │                             `sudo -n true` to determine state
    │
    ├──[cached]──► sudo -n -- <cmd...>             (no auth needed)

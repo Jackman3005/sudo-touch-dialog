@@ -43,6 +43,7 @@ _DROP_RES = [
     re.compile(rb'Sorry, try again\.\n?'),
     re.compile(rb'sudo: a password is required\n?'),
     re.compile(rb'sudo: \d+ incorrect password attempts?\n?'),
+    re.compile(rb'sudo: no password was provided\n?'),
 ]
 _FILTER_TAIL = 80  # bytes withheld each pass to catch patterns split across reads
 
@@ -188,6 +189,10 @@ class SudoApp(Adw.Application):
         self.state = None
         self._held = False  # whether we've called self.hold() to keep app alive past window close
         self.win = None
+        # Set to True once sudo spawns the wrapped command (auth confirmed).
+        # Reset before each new sudo invocation so retries (after a wrong
+        # password) can detect their own auth outcome independently.
+        self.cmd_started = False
 
     def do_activate(self):
         if is_cached():
@@ -229,9 +234,9 @@ class SudoApp(Adw.Application):
         body.append(caption)
 
         # Optional context line: an explanation passed by the caller (e.g.
-        # Claude Code) via CLAUDE_SUDO_REASON. Helps the user know *why*
+        # Claude Code) via AGENT_SUDO_REASON. Helps the user know *why*
         # this sudo is being requested.
-        reason = os.environ.get('CLAUDE_SUDO_REASON', '').strip()
+        reason = os.environ.get('AGENT_SUDO_REASON', '').strip()
         if reason:
             subtitle = Gtk.Label(label=reason)
             subtitle.set_halign(Gtk.Align.CENTER)
@@ -385,9 +390,12 @@ class SudoApp(Adw.Application):
             time.sleep(0.15)
 
     def _on_cmd_started(self):
-        if self.cancelled or not self.win:
+        if self.cancelled:
             return False
         # Auth done; sudo is now running the wrapped command.
+        self.cmd_started = True
+        if not self.win:
+            return False
         # hold() keeps the GApplication alive once the window closes so
         # _wait_sudo can still propagate the final exit code.
         self.hold()
@@ -417,6 +425,7 @@ class SudoApp(Adw.Application):
         env['SUDO_ASKPASS'] = BRIDGE
         env['SUDO_ASKPASS_FIFO'] = self.fifo_path
 
+        self.cmd_started = False
         try:
             self.sudo_proc = subprocess.Popen(
                 ['sudo', '-A', '--'] + self.command,
@@ -446,16 +455,38 @@ class SudoApp(Adw.Application):
         if self.cancelled:
             return False
         if self.killed_intentionally:
-            # We killed sudo to switch modes; drop this exit code on the
-            # floor — the new sudo (sudo -S) will produce the real one.
+            # We killed sudo to switch modes; drop this exit code — the
+            # new sudo (sudo -S) will produce the real one.
             self.killed_intentionally = False
             return False
-        # Sudo ran the command and exited. rc is the command's exit code
-        # (or sudo's auth-failure code, which we can't cleanly distinguish
-        # from a command rc). Forward whatever sudo gave us.
-        self.exit_code = rc
-        self._finish()
+        if rc == 0 or self.cmd_started:
+            # rc==0 always means success. cmd_started is the secondary
+            # signal for non-zero exits — if sudo handed off to the cmd
+            # at any point, this rc is the cmd's, not auth failure.
+            self.exit_code = rc
+            self._finish()
+            return False
+        # Sudo exited non-zero before launching the cmd → auth failed.
+        self._show_auth_retry()
         return False
+
+    _ERROR_MARKUP = (
+        '<span foreground="#f04a4a" weight="bold">'
+        'Wrong password — try again:</span>'
+    )
+
+    def _show_auth_retry(self):
+        """Reset the dialog into password mode with a red retry message."""
+        self.password_mode = True
+        self._set_spinner(False)
+        self.pw_entry.set_text('')
+        self.pw_entry.set_sensitive(True)
+        self.ok_btn.set_sensitive(True)
+        self._apply_state()
+        # _apply_state sets a default label for password mode; override it
+        # with the red error markup so the user clearly sees the retry.
+        self.state_label.set_markup(self._ERROR_MARKUP)
+        self.pw_entry.grab_focus()
 
     def _kill_sudo(self):
         # SIGKILL directly; SIGTERM would queue behind pam_u2f's blocking
@@ -488,6 +519,7 @@ class SudoApp(Adw.Application):
 
     def _run_sudo_s(self, pw):
         try:
+            self.cmd_started = False
             p = subprocess.Popen(
                 ['sudo', '-S', '--'] + self.command,
                 stdin=subprocess.PIPE,
@@ -513,6 +545,7 @@ class SudoApp(Adw.Application):
 
     def _run_cached(self):
         try:
+            self.cmd_started = False
             p = subprocess.Popen(
                 ['sudo', '-n', '--'] + self.command,
                 stdout=subprocess.PIPE,
@@ -531,12 +564,15 @@ class SudoApp(Adw.Application):
     def _on_sudo_done_pw(self, rc):
         if self.cancelled:
             return False
-        # If sudo with -S returned 1 right away and we never managed to
-        # auth, surface a retry prompt. Heuristic: if the run was very
-        # fast (< 1s) and we are in password mode, treat as auth failure.
-        # (Hard to be precise without parsing stderr.)
-        self.exit_code = rc
-        self._finish()
+        if rc == 0 or self.cmd_started:
+            # rc==0 means sudo succeeded (auth + cmd both fine). For very
+            # fast commands cmd_started may not have been observed by the
+            # poller before sudo exited, so don't gate on it for rc==0.
+            self.exit_code = rc
+            self._finish()
+            return False
+        # Sudo exited non-zero before launching the cmd → auth failed.
+        self._show_auth_retry()
         return False
 
     def _cancel(self):
